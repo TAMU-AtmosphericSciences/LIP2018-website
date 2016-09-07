@@ -1,0 +1,558 @@
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
+<head>
+	<meta http-equiv="Content-Style-Type" content="text/css" />
+	<meta http-equiv="Content-Script-Type" content="text/javascript" />
+	<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+	<meta charset="UTF-8">
+    <meta name="author" content="Patrick Stegmann">
+    <meta name="description" content="2D FDTD simulation">
+    <meta name="keywords" content="FDTD, Wave simulation, Javascript">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<link rel="icon" href="favicon.ico" type="image/x-icon" />
+	<link rel="stylesheet" href="../fdtd.css" type="text/css" media="screen" />
+	<title>FDTD Simulation Demo </title>
+	<script src="acoustic_2d_fdtd_core.js"></script>
+	<script src="acoustic_2d_fdtd_mur1st.js"></script>
+	<script src="lena256.js"></script>
+	<script type="text/javascript">
+
+/* 2-D Acoustic FDTD Simulation Demo in JavaScript (rev. Nov. 28th, 2014)
+    by Yoshiki NAGATANI
+      http://ultrasonics.jp/nagatani/e/
+      https://twitter.com/nagataniyoshiki
+
+  This is a truly physical simulation program of the sound wave propagation
+  in a two-dimensional field filled with fluid media and Mur's 1st order absorbing
+  boundary or a total reflecting wall.
+  (Mur's 1st order absorbing boundary is one of the easiest way to realize
+   an absorbing boundary although its performance is not the best.)
+
+  This program solves the equations of the "2D FDTD (finite-difference
+  time-domain) method".
+  The dark part consists of air (332 m/s) and the brighter part consists of
+  a mixture of air and helium (468 m/s). The grid resolution is 10 mm/pixel and
+  the time step is 15 us/step (us = micro second = 1/1000000 second). A single pulse
+  of sinusoidal wave at 1 kHz with Hann window is transmitted.
+  Have fun!!
+
+  ==================================================================================
+  [Usage]
+
+   - Click: Create a point source
+   - Drag:  Create a line source (i.e. an array of point sources)
+  ==================================================================================
+
+  *** Technical Notes ***
+   This program has been tested with Opera 25 (Blink) and Firefox 31 (Gecko) both on
+   Windows and OSX, Internet Explorer 11, and Spartan (Windows 10 TP 10049) on Windows.
+   It may be run also on Smartphones compatible with HTML5.
+   A touch operation is expected to work with Blink, WebKit, and Gecko. The speed of
+   calculation depends on the power of your PC. Intel Core i3 series or higher is
+   recommended.
+   For more detailed information about FDTD method (including 3-D elastic simulation),
+   please refer our papers on simulation. ==> http://ultrasonics.jp/nagatani/fdtd/
+   Thank you.
+
+   Modifications:
+   ==============
+   2016-09-02 |	Patrick STEGMANN | - Colour scheme adapted to Aggie Maroon and website is
+   								   now centered. 
+   								   - Text has been adapted for LIP conference.
+   								   - code modification has been explicitely mentioned.
+   								   - most of the selection buttons have been commented out.
+   								   - Background image for FDTD calculation has been changed
+   								     from Lena to LIP2018 logo in b&w.
+
+
+*/
+
+	"use strict";
+
+	var Thresh = 128;						/* Threshold for Binarizing Photo Image (0 to 255) */
+
+	var image_intensity = 250.0;			/* Brightness of Acoustic Field (>0) */
+	var model_intensity = 0.4;				/* Brightness of Model (>0) */
+	var DrawJetColormap = true;				/* true: MATLAB-like jet colormap / false: Gray scale */
+	var timeout_interval = 10;				/* Interval of Updating Field [ms] (0: fastest) */
+	var thinout_ratio = 2;					/* Image Output Ratio [steps/frame] (1: full) */
+
+	var RandomPointSourceInterval = 1000;	/* Interval of Rondom Source Transmission [steps] */
+	var MaxLineSourceNumber = 1000;			/* Maximum Number of Points of Line Source [points] */
+
+	var dx = 0.01;							/* Spatical Resolution [m] */
+	var dt = 15.0e-6;						/* Temporal Resolution [s] */
+	var dt_over_dx = dt / dx;				/* for more efficient calculation */
+
+	var rho   = [1.29,	0.73];				/* Densities [kg/m^3] */
+	var kappa = [142.0e3, 160.0e3];			/* Bulk Moduli [Pa] */
+
+	var freq = 1.0e3;						/* Frequency of Initial Waveform [Hz] */
+
+	var NX;									/* Spatial Size for X direction [pixels] */
+	var NY;									/* Spatial Size for Y direction [pixels] */
+
+	var n_point = 0;
+	var n_line = 1000;
+	var sig_point;
+	var sig_line;
+	var LineSourceNumber = 0;
+	var LineSourceDragging = false;
+	var LineSourceRunning = false;
+
+	var n_point_prev;
+
+	var canvas;
+	var ctx;
+	var Vx, Vy, P, Model;
+	var Mur_X1, Mur_Y1;
+	var LineSourceX, LineSourceY, SourceX, SourceY;
+	var img;
+
+
+	/* Initializing Model and Field *********************************************************/
+	window.onload = function(){
+		var i,j;
+
+		canvas = document.getElementById('fdtd');
+		if (canvas.getContext){	ctx = canvas.getContext('2d');	}
+		else{	console.log('Your browser is not compatible with canvas element.');	return;	}
+
+		canvas.addEventListener('mousedown', mousedown, false);
+		canvas.addEventListener('mousemove', mousemove, false);
+		canvas.addEventListener('mouseup', mouseup, false);
+		canvas.addEventListener('touchstart', touchstart, false);
+		canvas.addEventListener('touchmove', touchmove, false);
+		canvas.addEventListener('touchend', touchend, false);
+
+		NX = canvas.height;
+		NY = canvas.width;
+
+		Vx = new Array( NX+1 );			/* Particle Velocity for X direction [m/s] */
+		Vy = new Array( NX );			/* Particle Velocity for Y direction [m/s] */
+		P  = new Array( NX );			/* Sound Pressure [Pa] */
+		Model = new Array( NX );		/* Model */
+		Mur_X1 = new Array( 4 );		/* Mur's 1st-Order Absorption Boundary */
+		Mur_Y1 = new Array( NX );		/* Mur's 1st-Order Absorption Boundary */
+		LineSourceX = new Array(MaxLineSourceNumber);
+		LineSourceY = new Array(MaxLineSourceNumber);
+
+		img = ctx.createImageData(NY, NX);
+
+		SourceX = Math.floor(NX*0.3);		/* X coordinate of Sound Source [pixel] */
+		SourceY = Math.floor(NX*0.6);		/* Y coordinate of Sound Source [pixel] */
+
+		/* Array Allocation */
+		for(i=0;i<NX+1;i++){
+			Vx[i] = new Array(NY);
+		}
+		for(i=0;i<NX;i++){
+			Vy[i] = new Array(NY+1);
+		}
+		for(i=0;i<NX;i++){
+			P[i] = new Array(NY);
+		}
+		for(i=0;i<4;i++){
+			Mur_X1[i] = new Array(NY);
+		}
+		for(i=0;i<NX;i++){
+			Mur_Y1[i] = new Array(4);
+		}
+
+		/* Initialize Field Values */
+		InitField();
+		InitMur1st();
+
+		/* Initialize Model */
+		for(i=0;i<NX;i++){
+			Model[i] = new Array(NY);
+			for(j=0;j<NY;j++){
+  				Model[i][j] = 0;
+			}
+		}
+
+		/* Create Model */
+		for(i=0;i<Math.min(NX,photoX);i++){
+			for(j=0;j<Math.min(NY,photoY);j++){
+				if( photo[j*photoX+i] > Thresh )
+					Model[i][j] = 1;	// air and helium
+			}
+		}
+
+		DrawAcousticField();
+
+		setTimeout(fdtd,2000);
+		setTimeout(CountFPS,3000);
+
+	}
+
+	/* Main Function *********************************************************/
+	function fdtd(){
+
+		var i,j;
+		var col,col_r,col_g,col_b;
+
+		UpdateV();
+		UpdateP();
+
+		if( document.fdtd.abc.checked)	Mur1st();
+		else							Mur1stCopy();
+
+		/* Initial Waveform from a Point Source (1 pulse of sinusoidal wave with Hann window) */
+		if( n_point < (1.0/freq)/dt ){
+			sig_point = (1.0-Math.cos((2.0*Math.PI*freq*n_point*dt)))/2.0 * Math.sin((2.0*Math.PI*freq*n_point*dt));
+			P[SourceX][SourceY] += sig_point;
+		}
+
+		/* Initial Waveform from a Line Source (1 pulse of sinusoidal wave with Hann window) */
+		if( LineSourceRunning === true){
+			if( n_line < (1.0/freq)/dt ){
+				sig_line = (1.0-Math.cos((2.0*Math.PI*freq*n_line*dt)))/2.0 * Math.sin((2.0*Math.PI*freq*n_line*dt)) / Math.sqrt(LineSourceNumber);
+				for(i=0; i<LineSourceNumber; i++){
+					P[LineSourceX[i]][LineSourceY[i]] += sig_line;
+				}
+			}
+			else{
+				LineSourceRunning = false;
+			}
+		}
+
+		/* Output Step Numbers to Console */
+		console.log(n_point, n_line);
+
+		/* Draw the Acoustic Field */
+		DrawAcousticField();
+
+		n_point++;
+		n_line++;
+
+		/* Random Source at given time intervals */
+		if( n_point > RandomPointSourceInterval && n_line > RandomPointSourceInterval )
+			RandomSource();
+
+		setTimeout(fdtd,timeout_interval);
+
+	}
+
+
+	/* Sub Routines ************************************************************/
+
+	/* Draw the Acoustic Field to Canvas */
+	function DrawAcousticField()
+	{
+		var i, j;
+		var col, col_r, col_g, col_b;
+
+		if( n_point % thinout_ratio != 0 )
+			return;
+
+		for(i=0; i<NX; i++){
+			for(j=0; j<NY; j++){
+				col = Math.abs(P[i][j]*image_intensity + Model[i][j]*model_intensity);	// Value in Gray scale
+				if( DrawJetColormap ){	// conversion into Jet colormap
+					col = Math.min(4.0,col);	// avoid black color
+					col_r=255*Math.min(Math.max(Math.min(col-1.5,-col+4.5),0),1);
+					col_g=255*Math.min(Math.max(Math.min(col-0.5,-col+3.5),0),1);
+					col_b=255*Math.min(Math.max(Math.min(col+0.5,-col+2.5),0),1);
+				}
+				else{	// conversion into 255 scales
+					col_r=255*Math.min(Math.max(col,0),1);
+					col_g=col_r;
+					col_b=col_r;
+				}
+				img.data[4*(i*NY+j)]   = col_r;
+				img.data[4*(i*NY+j)+1] = col_g;
+				img.data[4*(i*NY+j)+2] = col_b;
+				img.data[4*(i*NY+j)+3] = 255;
+			}
+		}
+		/* Draw the Line Source while Mouse Dragging */
+		if( LineSourceDragging === true ){
+			for(i=0; i<LineSourceNumber; i++){
+				img.data[4*(LineSourceX[i]*NY+LineSourceY[i])  ] = 255;
+				img.data[4*(LineSourceX[i]*NY+LineSourceY[i])+1] = 127;
+				img.data[4*(LineSourceX[i]*NY+LineSourceY[i])+2] = 127;
+				img.data[4*(LineSourceX[i]*NY+LineSourceY[i])+3] = 255;
+			}
+		}
+		ctx.putImageData(img, 0, 0);
+	}
+
+	/* Create a Random Source */
+	function RandomSource()
+	{
+	    SourceX = Math.floor(Math.random()*(NX-1));
+	    SourceY = Math.floor(Math.random()*(NY-1));
+	    n_point = 0;
+	}
+
+	/* Start creating a Line Source on Mouse Dragging Trace */
+	function mousedown(m)
+	{
+		var mouseX,mouseY;
+		var rect = m.target.getBoundingClientRect();
+
+		mouseX = Math.round(m.clientX - rect.left);
+		mouseY = Math.round(m.clientY - rect.top);
+
+		if( n_line >= (1.0/freq)/dt ){	// Only one line source can exist simultaneously
+			// Start Dragging and Add the First Point
+			if( 0 < mouseY && mouseY < NX && 0 < mouseX && mouseX < NY ){
+				LineSourceDragging = true;
+				LineSourceX[0] = mouseY;
+				LineSourceY[0] = mouseX;
+				LineSourceNumber = 1;;
+			}
+		}
+	}
+
+	/* Add a Point to Line Source on Mouse Dragging Trace */
+	function mousemove(m)
+	{
+		var mouseX,mouseY;
+		var rect = m.target.getBoundingClientRect();
+
+		mouseX = Math.round(m.clientX - rect.left);
+		mouseY = Math.round(m.clientY - rect.top);
+
+		if( LineSourceDragging === true ){
+			// Add a Point to the Line Source
+			if( LineSourceNumber < MaxLineSourceNumber) {
+				if( 0 < mouseY && mouseY < NX && 0 < mouseX && mouseX < NY ){
+					LineSourceX[LineSourceNumber] = mouseY;
+					LineSourceY[LineSourceNumber] = mouseX;
+					LineSourceNumber++;
+				}
+			}
+		}
+	}
+
+	/* End Dragging */
+	function mouseup(m)
+	{
+		if( LineSourceDragging === true && LineSourceRunning === false && n_line >= (1.0/freq)/dt ){
+			LineSourceDragging = false;
+			LineSourceRunning = true;
+			n_line = 0;
+		}
+	}
+
+	/* Start creating a Line Source on Touch */
+	function touchstart(t)
+	{
+		if (event.targetTouches.length === 1) {	//  Initialize only on the first touch
+		    var touch = t.targetTouches[0];
+			var rect = t.target.getBoundingClientRect();
+
+			var touchX = Math.round(touch.pageX - rect.left - (document.body.scrollLeft || document.documentElement.scrollLeft));
+			var touchY = Math.round(touch.pageY - rect.top - (document.body.scrollTop || document.documentElement.scrollTop));
+			if( n_line >= (1.0/freq)/dt ){	// Only one line source can exist simultaneously
+				// Start Dragging and Add the First Point
+				if( 0 < touchY && touchY < NX && 0 < touchX && touchX < NY ){
+					LineSourceDragging = true;
+					LineSourceX[0] = touchY;
+					LineSourceY[0] = touchX;
+					LineSourceNumber = 1;;
+				}
+			}
+		}
+	}
+
+	/* Add a Point to Line Source on Touch Trace */
+	function touchmove(t)
+	{
+		for (var i = 0; i < event.targetTouches.length; i++){	// Multi touch
+		    var touch = t.targetTouches[i];
+			var rect = t.target.getBoundingClientRect();
+
+			var touchX = Math.round(touch.pageX - rect.left - (document.body.scrollLeft || document.documentElement.scrollLeft));
+			var touchY = Math.round(touch.pageY - rect.top - (document.body.scrollTop || document.documentElement.scrollTop));
+
+			if( LineSourceDragging === true ){
+				// Add a Point to the Line Source
+				if( LineSourceNumber < MaxLineSourceNumber) {
+					if( 0 < touchY && touchY < NX && 0 < touchX && touchX < NY ){
+						LineSourceX[LineSourceNumber] = touchY;
+						LineSourceY[LineSourceNumber] = touchX;
+						LineSourceNumber++;
+					}
+				}
+			}
+		}
+	}
+
+	/* End Dragging */
+	function touchend(t)
+	{
+		if( LineSourceDragging === true && LineSourceRunning === false && n_line >= (1.0/freq)/dt ){
+			LineSourceDragging = false;
+			LineSourceRunning = true;
+			n_line = 0;
+		}
+	}
+
+	/* Count FPS */
+	function CountFPS()
+	{
+		setTimeout(CountFPS,1000);
+
+		if(n_point >= n_point_prev ){
+			document.fdtd.fps.value = n_point - n_point_prev;
+		}
+		n_point_prev = n_point;
+	}
+
+</script>
+
+<style type="text/css">
+	canvas { border: 0px; }
+</style>
+
+</head>
+
+
+
+
+<body>
+<div id="wrapper">
+
+<div class="header">
+	 <a href="../../index.html">back to LIP 2018 main page </a> &gt; 2D Finite Difference Time Domain Simulation
+</div>
+
+<hr>
+
+<br>
+
+<h1>2D FDTD Mini Simulation<br><small> (JavaScript version)</small></h1>
+
+<hr>
+
+<br>
+
+<form name="fdtd">
+<p>
+	<strong>Click or Drag</strong> anywhere to create a light source<br>
+	<br>
+	<canvas id="fdtd" width="400" height="354"></canvas>
+	<img id="photo" src="lip_2018_logo.png" width="354" height="354" alt="LIP2018"><br>
+	<!--
+	<input type="button" name="clear" value=" clear sound field " onclick="InitField(); InitMur1st(); n_point=Math.floor((1.0/freq)/dt + 1); n_line=Math.floor((1.0/freq)/dt + 1);" style="height: 40px;">
+	<strong>Color:</strong> <input type="radio" name="colormap" value="j" id="j" onclick="DrawJetColormap=true;" checked><label for="j">Jet colormap</label>
+	<input type="radio" name="colormap" value="g" id="g" onclick="DrawJetColormap=false;"><label for="g">Gray scale</label><br>
+	<strong>Speed:</strong> <input type="radio" name="speed" value="ff" id="ff" onclick="timeout_interval=0;"><label for="ff">fastest (no wait)</label>
+	<input type="radio" name="speed" value="f" id="f" onclick="timeout_interval=10;" checked><label for="f">fast</label>
+	<input type="radio" name="speed" value="m" id="m" onclick="timeout_interval=30;"><label for="m">mid</label>
+	<input type="radio" name="speed" value="s" id="s" onclick="timeout_interval=100;"><label for="s">slow</label>
+	<input type="radio" name="speed" value="ss" id="ss" onclick="timeout_interval=1000;"><label for="ss">slowest</label><br>
+	<strong>Smoothness:</strong> <input type="radio" name="thinout" id="thin1" onclick="thinout_ratio=1;"><label for="thin1">1/1 (full)</label>
+	<input type="radio" name="thinout" id="thin2" onclick="thinout_ratio=2;" checked><label for="thin2">1/2</label>
+	<input type="radio" name="thinout" id="thin5" onclick="thinout_ratio=5;"><label for="thin5">1/5</label>
+	<input type="radio" name="thinout" id="thin10" onclick="thinout_ratio=10;"><label for="thin10">1/10</label>
+	<input type="radio" name="thinout" id="thin100" onclick="thinout_ratio=100;"><label for="thin100">1/100</label>
+	<input type="radio" name="thinout" id="thin1000" onclick="thinout_ratio=1000;"><label for="thin1000">1/1000</label><br> -->
+	<br>
+	<input type="checkbox" name="abc" id="abc" checked><label for="abc">Enable Absorbing Boundary (Mur's 1st order absorbing boundary)</label><br>
+	
+	<!-- <input type="text" name="fps" value="-" size="2"> steps/second -->
+</p>
+</form>
+
+<!--
+<h2>Brief Notes</h2>
+<p>
+  This is a truly physical simulation program of the sound wave propagation
+  in a two-dimensional field filled with fluid media and Mur's 1st order absorbing
+  boundary or a total reflecting wall.
+  (Mur's 1st order absorbing boundary is one of the easiest way to realize
+   an absorbing boundary although the performance is not the best.)
+</p>
+<p>
+  This program solves the equations of the "2D Acoustic FDTD (finite-difference
+  time-domain) method".
+  The dark part consists of air (332 m/s) and the brighter part consists of
+  a mixture of air and helium (468 m/s). The grid resolution is 10 mm/pixel and
+  the time step is 15 &mu;s/step (&mu;s = micro second = 1/1000000 second). A single
+  pulse of sinusoidal wave at 1 kHz with Hann window is transmitted.
+</p>
+<p>
+  Have fun!!
+</p>
+
+<h2>Technical Notes</h2>
+<p>
+   This program has been tested with Opera 25 (Blink) and Firefox 31 (Gecko) both on
+   Windows and OSX, Internet Explorer 11, and Spartan on Windows. It may be run also on
+   Smartphones compatible with HTML5.
+   A touch operation is expected to work with Blink, WebKit, and Gecko. The speed of
+   calculation depends on the power of your PC. Intel Core i3 series or higher is
+   recommended.</p>
+<p>
+   For more detailed information about FDTD method (including 3-D elastic simulation),
+   please refer our papers on simulation.<br>
+   &rArr; <a href="http://ultrasonics.jp/nagatani/e/">http://ultrasonics.jp/nagatani/e/</a><br>
+</p>
+<p>
+   Thank you.
+</p>
+
+<h2>Acknowledgement</h2>
+<p>
+I deeply appreciate <a href="https://www.researchgate.net/profile/Ryosuke_Tachibana" target="_blank">Dr. Ryosuke TACHIBANA</a> (<a href="https://twitter.com/ro_tachi" target="_blank"><img src="../../img/twitter.png" width="16" height="16" alt="Twitter">@ro_tachi</a>) (The University of Tokyo) providing an insightful idea of creating visualized simulation projects and testing the program. I also would like to thank Mr. Takaaki IBARAKI of Gehirn Inc. (@umisama) for reviewing the codes and giving a lot of important comments on coding.
+</p>
+
+<h2>History</h2>
+<dl>
+	<dt>Apr. 5th, 2015</dt><dd>Confirmed the compatibility with Spartan (Windows 10 TP 10049). (Nothing was changed.)</dd>
+	<dt>Nov. 28th, 2014</dt><dd>first version.</dd>
+</dl>
+
+-->
+
+<br>
+<br>
+<!--
+<div class="sns">
+<span id="fb-root"></span>
+<script>(function(d, s, id) {
+  var js, fjs = d.getElementsByTagName(s)[0];
+  if (d.getElementById(id)) return;
+  js = d.createElement(s); js.id = id;
+  js.src = "//connect.facebook.net/ja_JP/sdk.js#xfbml=1&version=v2.0";
+  fjs.parentNode.insertBefore(js, fjs);
+}(document, 'script', 'facebook-jssdk'));</script>
+<span class="fb-like" data-href="http://ultrasonics.jp/nagatani/fdtd/javascript/acoustic_2d_fdtd_lena256.html" data-layout="button_count" data-action="like" data-show-faces="false" data-share="true"></span>
+</div>
+<div class="sns">
+<a href="https://twitter.com/share" class="twitter-share-button" data-lang="en" data-url="http://ultrasonics.jp/nagatani/fdtd/javascript/acoustic_2d_fdtd_lena256.html" data-text='"2-D Acoustic FDTD Simulation Demo - JavaScript version"'>Tweet</a>
+<script>
+<!--
+!function(d,s,id){var js,fjs=d.getElementsByTagName(s)[0];if(!d.getElementById(id)){js=d.createElement(s);js.id=id;js.src="//platform.twitter.com/widgets.js";fjs.parentNode.insertBefore(js,fjs);}}(document,"script","twitter-wjs");
+--><!--
+</script>
+</div>
+
+<br>
+
+<div class="footer">
+	[&rArr; <a href="../index.html">Return to FDTD top page</a>]
+</div>
+
+<br>
+
+<div class="footer">
+[last updated on Apr. 5th, 2015]
+</div>
+-->
+<hr>
+
+<div class="footer">
+	modified version by Patrick STEGMANN    ( <a href="http://atmo.tamu.edu//people/researchpersonnel/stegmannpatrick">Texas A&ampM </a> | <a href="http://www.graduate-school-ce.de/index.php?id=601">TU Darmstadt</a> )
+	 <br>
+	original code by Yoshiki NAGATANI (Kobe City College of Technology / Université Paris-Est Créteil)<br>
+</div>
+
+</div>
+</body>
+</html>
